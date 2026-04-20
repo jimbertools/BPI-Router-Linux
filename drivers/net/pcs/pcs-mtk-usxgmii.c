@@ -18,6 +18,7 @@
 #include <linux/phylink.h>
 #include <linux/platform_device.h>
 #include <linux/rtnetlink.h>
+#include <linux/workqueue.h>
 
 /* USXGMII subsystem config registers */
 /* Register to control speed */
@@ -79,6 +80,8 @@ struct mtk_usxgmii_pcs {
 	struct phy			*xfi_tphy;
 	phy_interface_t			interface;
 	unsigned int			neg_mode;
+	struct delayed_work		link_poll;
+	unsigned int			link_down_cnt;
 	struct list_head		node;
 };
 
@@ -291,12 +294,18 @@ static void mtk_usxgmii_pcs_get_state(struct phylink_pcs *pcs,
 	state->link = FIELD_GET(RG_PCS_RX_LINK_STATUS,
 				mtk_r32(mpcs, RG_PCS_RX_STATUS0));
 
-	/* Continuously repeat re-configuration sequence until link comes up */
+	/* If link is down, let the delayed work handle recovery
+	 * instead of doing a full PCS reset inline which disrupts TX.
+	 */
 	if (!state->link) {
-		mtk_usxgmii_pcs_config(pcs, mpcs->neg_mode,
-				       state->interface, NULL, false);
+		mpcs->link_down_cnt++;
+		if (!delayed_work_pending(&mpcs->link_poll))
+			schedule_delayed_work(&mpcs->link_poll,
+					      msecs_to_jiffies(1000));
 		return;
 	}
+
+	mpcs->link_down_cnt = 0;
 
 	if (FIELD_GET(USXGMII_AN_ENABLE, mtk_r32(mpcs, RG_PCS_AN_CTRL0)))
 		mtk_usxgmii_pcs_get_an_state(mpcs, state);
@@ -325,6 +334,44 @@ static void mtk_usxgmii_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mo
 	phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
 }
 
+static void mtk_usxgmii_pcs_link_poll(struct work_struct *work)
+{
+	struct mtk_usxgmii_pcs *mpcs = container_of(work, struct mtk_usxgmii_pcs,
+						    link_poll.work);
+	u32 status;
+
+	if (mpcs->interface != PHY_INTERFACE_MODE_5GBASER &&
+	    mpcs->interface != PHY_INTERFACE_MODE_10GBASER &&
+	    mpcs->interface != PHY_INTERFACE_MODE_USXGMII)
+		return;
+
+	/* Refresh link status */
+	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE,
+		RG_PCS_RX_STATUS_UPDATE);
+	ndelay(1020);
+	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE, 0);
+	ndelay(1020);
+
+	status = FIELD_GET(RG_PCS_RX_LINK_STATUS,
+			   mtk_r32(mpcs, RG_PCS_RX_STATUS0));
+
+	if (status) {
+		mpcs->link_down_cnt = 0;
+		return;
+	}
+
+	/* Link is genuinely down, do recovery */
+	dev_dbg(mpcs->dev, "link_poll: reconfiguring PCS (down_cnt=%u)\n",
+		mpcs->link_down_cnt);
+	mtk_usxgmii_pcs_config(&mpcs->pcs, mpcs->neg_mode,
+			       mpcs->interface, NULL, false);
+	phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, mpcs->interface);
+
+	/* Re-schedule if still down */
+	if (!delayed_work_pending(&mpcs->link_poll))
+		schedule_delayed_work(&mpcs->link_poll, msecs_to_jiffies(1000));
+}
+
 static int mtk_usxgmii_pcs_enable(struct phylink_pcs *pcs)
 {
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
@@ -338,8 +385,11 @@ static void mtk_usxgmii_pcs_disable(struct phylink_pcs *pcs)
 {
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
 
+	cancel_delayed_work_sync(&mpcs->link_poll);
+
 	mpcs->interface = PHY_INTERFACE_MODE_NA;
 	mpcs->neg_mode = -1;
+	mpcs->link_down_cnt = 0;
 
 	phy_power_off(mpcs->xfi_tphy);
 }
@@ -386,6 +436,7 @@ static int mtk_usxgmii_probe(struct platform_device *pdev)
 	mpcs->pcs.poll = true;
 	mpcs->interface = PHY_INTERFACE_MODE_NA;
 	mpcs->neg_mode = -1;
+	INIT_DELAYED_WORK(&mpcs->link_poll, mtk_usxgmii_pcs_link_poll);
 
 	__set_bit(PHY_INTERFACE_MODE_5GBASER, mpcs->pcs.supported_interfaces);
 	__set_bit(PHY_INTERFACE_MODE_10GBASER, mpcs->pcs.supported_interfaces);
@@ -414,6 +465,7 @@ static void mtk_usxgmii_remove(struct platform_device *pdev)
 {
 	struct mtk_usxgmii_pcs *mpcs = platform_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&mpcs->link_poll);
 	fwnode_pcs_del_provider(dev_fwnode(&pdev->dev));
 
 	rtnl_lock();
