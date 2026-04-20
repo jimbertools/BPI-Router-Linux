@@ -6257,19 +6257,23 @@ static int mtk_probe(struct platform_device *pdev)
 		dev_err(eth->dev, "failed to allocated dummy device\n");
 		goto err_unreg_netdev;
 	}
-	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
-	netif_napi_add(eth->dummy_dev, &eth->rx_napi[0].napi, mtk_napi_rx);
+	netif_napi_add_weight(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx,
+			      MTK_NAPI_WEIGHT);
+	netif_napi_add_weight(eth->dummy_dev, &eth->rx_napi[0].napi, mtk_napi_rx,
+			      MTK_NAPI_WEIGHT);
 
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
 		for (i = 1; i < MTK_RX_RSS_NUM; i++)
-			netif_napi_add(eth->dummy_dev, &eth->rx_napi[MTK_RSS_RING(i)].napi,
-				       mtk_napi_rx);
+			netif_napi_add_weight(eth->dummy_dev,
+					      &eth->rx_napi[MTK_RSS_RING(i)].napi,
+					      mtk_napi_rx, MTK_NAPI_WEIGHT);
 	}
 
 	if (eth->hwlro) {
 		for (i = 0; i < MTK_HW_LRO_RING_NUM; i++) {
-			netif_napi_add(eth->dummy_dev, &eth->rx_napi[MTK_HW_LRO_RING(i)].napi,
-				       mtk_napi_rx);
+			netif_napi_add_weight(eth->dummy_dev,
+					      &eth->rx_napi[MTK_HW_LRO_RING(i)].napi,
+					      mtk_napi_rx, MTK_NAPI_WEIGHT);
 		}
 	}
 
