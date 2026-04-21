@@ -571,10 +571,11 @@ static int mtk_mac_prepare(struct phylink_config *config, unsigned int mode,
 					   phylink_config);
 	struct mtk_eth *eth = mac->hw;
 
-	if (mtk_interface_mode_is_xgmii(eth, iface) &&
-	    mac->id != MTK_GMAC1_ID) {
-		mtk_m32(mac->hw, XMAC_MCR_TRX_DISABLE,
-			XMAC_MCR_TRX_DISABLE, MTK_XMAC_MCR(mac->id));
+	if (mtk_is_netsys_v3_or_greater(eth) &&
+	    mtk_interface_mode_is_xgmii(eth, iface)) {
+		if (mac->id != MTK_GMAC1_ID)
+			mtk_m32(mac->hw, XMAC_MCR_TRX_DISABLE,
+				XMAC_MCR_TRX_DISABLE, MTK_XMAC_MCR(mac->id));
 
 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
 			mtk_m32(mac->hw, XMAC_FORCE_RX_FC_MODE | XMAC_FORCE_TX_FC_MODE |
@@ -790,9 +791,6 @@ static void mtk_mac_link_down(struct phylink_config *config, unsigned int mode,
 		mtk_m32(mac->hw,
 			MAC_MCR_TX_EN | MAC_MCR_RX_EN | MAC_MCR_FORCE_LINK, 0,
 			MTK_MAC_MCR(mac->id));
-		if (mtk_is_netsys_v3_or_greater(mac->hw))
-			mtk_m32(mac->hw, MTK_XGMAC_FORCE_LINK(mac->id), 0,
-				MTK_XGMAC_STS(mac->id));
 	} else if (mtk_is_netsys_v3_or_greater(mac->hw) && mac->id != MTK_GMAC1_ID) {
 		/* XGMAC except for built-in switch */
 		mtk_m32(mac->hw, XMAC_MCR_TRX_DISABLE, XMAC_MCR_TRX_DISABLE,
