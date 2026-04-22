@@ -105,6 +105,19 @@ static struct mtk_usxgmii_pcs *pcs_to_mtk_usxgmii_pcs(struct phylink_pcs *pcs)
 	return container_of(pcs, struct mtk_usxgmii_pcs, pcs);
 }
 
+static bool mtk_usxgmii_link_status(struct mtk_usxgmii_pcs *mpcs)
+{
+	/* Refresh link status by toggling update bit */
+	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE,
+		RG_PCS_RX_STATUS_UPDATE);
+	ndelay(1020);
+	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE, 0);
+	ndelay(1020);
+
+	return FIELD_GET(RG_PCS_RX_LINK_STATUS,
+			 mtk_r32(mpcs, RG_PCS_RX_STATUS0));
+}
+
 static void mtk_usxgmii_reset(struct mtk_usxgmii_pcs *mpcs)
 {
 	reset_control_assert(mpcs->reset);
@@ -283,16 +296,7 @@ static void mtk_usxgmii_pcs_get_state(struct phylink_pcs *pcs,
 {
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
 
-	/* Refresh USXGMII link status by toggling RG_PCS_AN_STATUS_UPDATE */
-	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE,
-		RG_PCS_RX_STATUS_UPDATE);
-	ndelay(1020);
-	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE, 0);
-	ndelay(1020);
-
-	/* Read USXGMII link status */
-	state->link = FIELD_GET(RG_PCS_RX_LINK_STATUS,
-				mtk_r32(mpcs, RG_PCS_RX_STATUS0));
+	state->link = mtk_usxgmii_link_status(mpcs);
 
 	/* If link is down, let the delayed work handle recovery
 	 * instead of doing a full PCS reset inline which disrupts TX.
@@ -325,13 +329,16 @@ static void mtk_usxgmii_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mo
 				    int speed, int duplex)
 {
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+	unsigned long timeout = jiffies + msecs_to_jiffies(3000);
 
-	/* Reconfiguring USXGMII to ensure the quality of the RX signal
-	 * after the line side link up.
-	 */
-	mtk_usxgmii_pcs_config(pcs, neg_mode, interface, NULL, false);
-	phy_reset(mpcs->xfi_tphy);
-	phy_set_mode_ext(mpcs->xfi_tphy, PHY_MODE_ETHERNET, interface);
+	while (time_before(jiffies, timeout)) {
+		if (mtk_usxgmii_link_status(mpcs))
+			return;
+
+		msleep(100);
+	}
+
+	dev_warn(mpcs->dev, "wait link up timeout\n");
 }
 
 static void mtk_usxgmii_pcs_link_poll(struct work_struct *work)
@@ -345,18 +352,13 @@ static void mtk_usxgmii_pcs_link_poll(struct work_struct *work)
 	    mpcs->interface != PHY_INTERFACE_MODE_USXGMII)
 		return;
 
-	/* Refresh link status */
-	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE,
-		RG_PCS_RX_STATUS_UPDATE);
-	ndelay(1020);
-	mtk_m32(mpcs, RG_PCS_RX_STATUS0, RG_PCS_RX_STATUS_UPDATE, 0);
-	ndelay(1020);
-
-	status = FIELD_GET(RG_PCS_RX_LINK_STATUS,
-			   mtk_r32(mpcs, RG_PCS_RX_STATUS0));
+	status = mtk_usxgmii_link_status(mpcs);
 
 	if (status) {
 		mpcs->link_down_cnt = 0;
+		if (!delayed_work_pending(&mpcs->link_poll))
+			schedule_delayed_work(&mpcs->link_poll,
+					      msecs_to_jiffies(1000));
 		return;
 	}
 
@@ -377,6 +379,9 @@ static int mtk_usxgmii_pcs_enable(struct phylink_pcs *pcs)
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
 
 	phy_power_on(mpcs->xfi_tphy);
+
+	if (!delayed_work_pending(&mpcs->link_poll))
+		schedule_delayed_work(&mpcs->link_poll, msecs_to_jiffies(1000));
 
 	return 0;
 }
